@@ -98,18 +98,6 @@ static int cluster_from_token(const char *token, enum randcore_cluster *cluster)
     return -1;
 }
 
-static bool streq(const char *lhs, const char *rhs) {
-    return strcmp(lhs, rhs) == 0;
-}
-
-static bool requested_compiler_is_gcc(const char *compiler) {
-    return streq(compiler, "gcc");
-}
-
-static bool requested_compiler_is_gxx(const char *compiler) {
-    return streq(compiler, "g++");
-}
-
 static const char *requested_compiler_name(const char *argv0) {
     const char *name = base_name(argv0);
     size_t prefix_len = strlen(RANDCORE_PREFIX);
@@ -122,31 +110,7 @@ static const char *requested_compiler_name(const char *argv0) {
     return name[0] == '\0' ? NULL : name;
 }
 
-static const char *real_compiler_path(const char *requested_compiler) {
-    const char *env = getenv("RANDCORE_REAL_COMPILER");
-
-    if (!is_empty(env)) {
-        return env;
-    }
-
-    if (requested_compiler_is_gcc(requested_compiler)) {
-        env = getenv("RANDCORE_GCC");
-        if (!is_empty(env)) {
-            return env;
-        }
-    }
-
-    if (requested_compiler_is_gxx(requested_compiler)) {
-        env = getenv("RANDCORE_GXX");
-        if (!is_empty(env)) {
-            return env;
-        }
-    }
-
-    return requested_compiler;
-}
-
-static char **make_exec_argv(int argc, char **argv, const char *compiler_path) {
+static char **make_exec_argv(int argc, char **argv, const char *compiler_name) {
     char **exec_argv = calloc((size_t)argc + 1, sizeof(*exec_argv));
     int i;
 
@@ -154,7 +118,7 @@ static char **make_exec_argv(int argc, char **argv, const char *compiler_path) {
         return NULL;
     }
 
-    exec_argv[0] = (char *)base_name(compiler_path);
+    exec_argv[0] = (char *)compiler_name;
     for (i = 1; i < argc; i++) {
         exec_argv[i] = argv[i];
     }
@@ -627,23 +591,19 @@ static int read_child_report(int fd, struct child_report *report) {
     return 0;
 }
 
-static int exec_compiler_now(const char *compiler_path, char **exec_argv) {
+static int exec_compiler_now(const char *compiler_name, char **exec_argv) {
     int saved_errno;
 
-    if (strchr(compiler_path, '/') != NULL) {
-        execv(compiler_path, exec_argv);
-    } else {
-        execvp(compiler_path, exec_argv);
-    }
+    execvp(compiler_name, exec_argv);
 
     saved_errno = errno;
-    fprintf(stderr, "randcore-compiler: failed to exec %s: %s\n", compiler_path,
+    fprintf(stderr, "randcore-compiler: failed to exec %s: %s\n", compiler_name,
             strerror(saved_errno));
     return saved_errno == ENOENT ? 127 : 126;
 }
 
 static void child_exec(enum randcore_cluster desired, const char *proc_ai_thread, bool strict,
-                       bool quiet, const char *compiler_path, char **exec_argv, int report_fd) {
+                       bool quiet, const char *compiler_name, char **exec_argv, int report_fd) {
     enum randcore_cluster actual = desired;
     int setup_errno = 0;
 
@@ -665,7 +625,7 @@ static void child_exec(enum randcore_cluster desired, const char *proc_ai_thread
 
     send_child_report(report_fd, CHILD_SETUP_OK, setup_errno, actual);
     close(report_fd);
-    _exit(exec_compiler_now(compiler_path, exec_argv));
+    _exit(exec_compiler_now(compiler_name, exec_argv));
 }
 
 static int wait_for_child(pid_t pid, bool quiet) {
@@ -716,16 +676,16 @@ static void cleanup_child_record(const char *state_dir, pid_t pid, unsigned long
     close_state_files(&files);
 }
 
-static int run_untracked_x100(const char *compiler_path, char **exec_argv, bool log) {
+static int run_untracked_x100(const char *compiler_name, char **exec_argv, bool log) {
     if (log) {
         fprintf(stderr, "randcore-compiler: state unavailable -> X100/default -> %s\n",
-                compiler_path);
+                compiler_name);
     }
 
-    return exec_compiler_now(compiler_path, exec_argv);
+    return exec_compiler_now(compiler_name, exec_argv);
 }
 
-static int run_balanced(int argc, char **argv, const char *compiler_path,
+static int run_balanced(int argc, char **argv, const char *compiler_name,
                         const char *proc_ai_thread, bool strict, bool quiet, bool log) {
     const char *state_dir = getenv("RANDCORE_STATE_DIR");
     struct state_files files;
@@ -744,7 +704,7 @@ static int run_balanced(int argc, char **argv, const char *compiler_path,
         state_dir = DEFAULT_STATE_DIR;
     }
 
-    exec_argv = make_exec_argv(argc, argv, compiler_path);
+    exec_argv = make_exec_argv(argc, argv, compiler_name);
     if (exec_argv == NULL) {
         fprintf(stderr, "randcore-compiler: out of memory\n");
         return 1;
@@ -757,7 +717,7 @@ static int run_balanced(int argc, char **argv, const char *compiler_path,
             free(exec_argv);
             return 1;
         }
-        return run_untracked_x100(compiler_path, exec_argv, log);
+        return run_untracked_x100(compiler_name, exec_argv, log);
     }
 
     if (read_state_fd(files.state_fd, &state) != 0) {
@@ -768,7 +728,7 @@ static int run_balanced(int argc, char **argv, const char *compiler_path,
             free(exec_argv);
             return 1;
         }
-        return run_untracked_x100(compiler_path, exec_argv, log);
+        return run_untracked_x100(compiler_name, exec_argv, log);
     }
 
     if (write_state_fd(files.state_fd, &state) != 0) {
@@ -780,7 +740,7 @@ static int run_balanced(int argc, char **argv, const char *compiler_path,
             free(exec_argv);
             return 1;
         }
-        return run_untracked_x100(compiler_path, exec_argv, log);
+        return run_untracked_x100(compiler_name, exec_argv, log);
     }
 
     decision = choose_route(&state);
@@ -794,7 +754,7 @@ static int run_balanced(int argc, char **argv, const char *compiler_path,
             free(exec_argv);
             return 1;
         }
-        return run_untracked_x100(compiler_path, exec_argv, log);
+        return run_untracked_x100(compiler_name, exec_argv, log);
     }
 
     child = fork();
@@ -809,13 +769,13 @@ static int run_balanced(int argc, char **argv, const char *compiler_path,
             free(exec_argv);
             return 1;
         }
-        return run_untracked_x100(compiler_path, exec_argv, log);
+        return run_untracked_x100(compiler_name, exec_argv, log);
     }
 
     if (child == 0) {
         close(pipe_fds[0]);
         close_state_files(&files);
-        child_exec(decision.desired, proc_ai_thread, strict, quiet, compiler_path, exec_argv,
+        child_exec(decision.desired, proc_ai_thread, strict, quiet, compiler_name, exec_argv,
                    pipe_fds[1]);
     }
 
@@ -848,12 +808,12 @@ static int run_balanced(int argc, char **argv, const char *compiler_path,
             if (decision.desired == actual) {
                 fprintf(stderr, "randcore-compiler: X100 count=%zu A100 count=%zu -> %s -> %s\n",
                         decision.x100_count, decision.a100_count, cluster_name(actual),
-                        compiler_path);
+                        compiler_name);
             } else {
                 fprintf(stderr,
                         "randcore-compiler: X100 count=%zu A100 count=%zu -> %s, fallback %s -> %s\n",
                         decision.x100_count, decision.a100_count, cluster_name(decision.desired),
-                        cluster_name(actual), compiler_path);
+                        cluster_name(actual), compiler_name);
             }
         }
 
@@ -883,7 +843,6 @@ static int run_balanced(int argc, char **argv, const char *compiler_path,
 
 int main(int argc, char **argv) {
     const char *requested_compiler;
-    const char *compiler_path;
     const char *proc_ai_thread = getenv("RANDCORE_SET_AI_THREAD");
     const bool strict = parse_bool_env("RANDCORE_STRICT");
     const bool quiet = parse_bool_env("RANDCORE_QUIET");
@@ -900,11 +859,9 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    compiler_path = real_compiler_path(requested_compiler);
-
     if (is_empty(proc_ai_thread)) {
         proc_ai_thread = DEFAULT_PROC_AI_THREAD;
     }
 
-    return run_balanced(argc, argv, compiler_path, proc_ai_thread, strict, quiet, log);
+    return run_balanced(argc, argv, requested_compiler, proc_ai_thread, strict, quiet, log);
 }

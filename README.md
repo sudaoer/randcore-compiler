@@ -58,9 +58,6 @@ wrapper 默认把状态写到 `/tmp/randcore-compiler-$UID.state`，锁文件为
 ## 配置项
 
 - `RANDCORE_STATE_DIR`：状态文件和锁文件目录，默认 `/tmp`。
-- `RANDCORE_REAL_COMPILER`：强制指定真实编译器，优先级最高。
-- `RANDCORE_GCC`：仅在 wrapper 名为 `randcore-gcc` 时覆盖真实编译器。
-- `RANDCORE_GXX`：仅在 wrapper 名为 `randcore-g++` 时覆盖真实编译器。
 - `RANDCORE_SET_AI_THREAD`：HMP proc 文件路径，默认 `/proc/set_ai_thread`。
 - `RANDCORE_STRICT=1`：状态文件/锁失败，或选择 A100 但写入 `/proc/set_ai_thread` 失败时直接退出。
 - `RANDCORE_QUIET=1`：隐藏状态文件或 `/proc/set_ai_thread` 失败时的警告。
@@ -71,8 +68,9 @@ wrapper 默认把状态写到 `/tmp/randcore-compiler-$UID.state`，锁文件为
 在 K3 上可以用下面的命令检查 wrapper 是否会平衡分配：
 
 ```sh
+make randcore-sh
 for i in 1 2 3 4; do
-  RANDCORE_LOG=1 RANDCORE_REAL_COMPILER=/bin/sh ./randcore-gcc -c \
+  RANDCORE_LOG=1 ./randcore-sh -c \
     'grep Cpus_allowed_list /proc/$$/status; sleep 1' &
 done
 wait
