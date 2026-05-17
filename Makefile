@@ -13,14 +13,17 @@ $(PRIMARY): compiler-wrapper.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
 
 $(filter-out $(PRIMARY),$(WRAPPERS)): $(PRIMARY)
-	cp -f $(PRIMARY) $@
+	ln -sf $(PRIMARY) $@
 
 randcore-%: $(PRIMARY)
-	cp -f $(PRIMARY) $@
+	ln -sf $(PRIMARY) $@
 
 install: all
 	install -d $(DESTDIR)$(BINDIR)
-	install -m 0755 $(WRAPPERS) $(DESTDIR)$(BINDIR)
+	install -m 0755 $(PRIMARY) $(DESTDIR)$(BINDIR)
+	set -e; for wrapper in $(filter-out $(PRIMARY),$(WRAPPERS)); do \
+		ln -sf $(PRIMARY) $(DESTDIR)$(BINDIR)/$$wrapper; \
+	done
 
 clean:
 	rm -f $(PRIMARY) $(filter-out $(PRIMARY),$(WRAPPERS))
