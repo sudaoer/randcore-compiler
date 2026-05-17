@@ -83,3 +83,7 @@ wait
 - 日志中的 `X100 count=... A100 count=... -> ...` 会优先选择任务数较少的一边。
 - X100 任务的 `Cpus_allowed_list` 通常是 `0-7`。
 - A100 任务的 `Cpus_allowed_list` 通常是 `8-15`。
+
+## 许可证
+
+WTFPL，见 [LICENSE](LICENSE)。
