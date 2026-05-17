@@ -14,7 +14,6 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <utility>
 #include <vector>
 
 namespace {
@@ -33,11 +32,6 @@ struct StateRecord {
     pid_t pid = 0;
     unsigned long long start_time = 0;
     Cluster cluster = Cluster::X100;
-};
-
-struct RandcoreState {
-    Cluster next_tie = Cluster::A100;
-    std::vector<StateRecord> records;
 };
 
 struct RouteDecision {
@@ -94,16 +88,62 @@ class UniqueFd {
     int fd_ = -1;
 };
 
-struct StateFiles {
-    UniqueFd lock_fd;
-    UniqueFd state_fd;
-    std::string lock_path;
-    std::string state_path;
+class StateFiles {
+  public:
+    bool open(const std::string &state_dir) {
+        lock_path_ = make_path(state_dir, "lock");
+        state_path_ = make_path(state_dir, "state");
+
+        lock_fd_.reset(::open(lock_path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600));
+        if (!lock_fd_.valid() || !lock_state_file()) {
+            return false;
+        }
+
+        state_fd_.reset(::open(state_path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600));
+        return state_fd_.valid();
+    }
+
+    int state_fd() const { return state_fd_.get(); }
 
     void close() {
-        state_fd.reset();
-        lock_fd.reset();
+        state_fd_.reset();
+        lock_fd_.reset();
     }
+
+  private:
+    static std::string make_path(const std::string &state_dir, const char *suffix) {
+        std::string path = state_dir;
+        if (!path.empty() && path.back() != '/') {
+            path += '/';
+        }
+
+        path += kStateBasename;
+        path += '-';
+        path += std::to_string(static_cast<unsigned long>(getuid()));
+        path += '.';
+        path += suffix;
+        return path;
+    }
+
+    bool lock_state_file() const {
+        flock lock{};
+        lock.l_type = F_WRLCK;
+        lock.l_whence = SEEK_SET;
+
+        while (fcntl(lock_fd_.get(), F_SETLKW, &lock) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    UniqueFd lock_fd_;
+    UniqueFd state_fd_;
+    std::string lock_path_;
+    std::string state_path_;
 };
 
 bool is_empty(const char *value) {
@@ -282,54 +322,126 @@ bool record_is_active(const StateRecord &record) {
     return read_proc_start_time(record.pid, start_time) && start_time == record.start_time;
 }
 
-void parse_state_line(RandcoreState &state, const std::string &line) {
-    if (line.empty() || line[0] == '#') {
-        return;
-    }
+class RandcoreState {
+  public:
+    void parse_line(const std::string &line) {
+        if (line.empty() || line[0] == '#') {
+            return;
+        }
 
-    std::istringstream fields(line);
-    std::string first;
-    if (!(fields >> first)) {
-        return;
-    }
+        std::istringstream fields(line);
+        std::string first;
+        if (!(fields >> first)) {
+            return;
+        }
 
-    if (first == "next_tie") {
+        if (first == "next_tie") {
+            std::string cluster_text;
+            Cluster cluster;
+            if (fields >> cluster_text && cluster_from_token(cluster_text, cluster)) {
+                next_tie_ = cluster;
+            }
+            return;
+        }
+
+        constexpr std::string_view next_tie_equals = "next_tie=";
+        if (first.rfind(next_tie_equals, 0) == 0) {
+            Cluster cluster;
+            if (cluster_from_token(first.substr(next_tie_equals.size()), cluster)) {
+                next_tie_ = cluster;
+            }
+            return;
+        }
+
+        long pid_value = 0;
+        unsigned long long start_time = 0;
+        std::string start_text;
         std::string cluster_text;
         Cluster cluster;
-        if (fields >> cluster_text && cluster_from_token(cluster_text, cluster)) {
-            state.next_tie = cluster;
+        if (!parse_long(first, pid_value) || pid_value <= 0 ||
+            !(fields >> start_text >> cluster_text) ||
+            !parse_unsigned_long_long(start_text, start_time) ||
+            !cluster_from_token(cluster_text, cluster)) {
+            return;
         }
-        return;
+
+        append_if_active(StateRecord{static_cast<pid_t>(pid_value), start_time, cluster});
     }
 
-    constexpr std::string_view next_tie_equals = "next_tie=";
-    if (first.rfind(next_tie_equals, 0) == 0) {
-        Cluster cluster;
-        if (cluster_from_token(first.substr(next_tie_equals.size()), cluster)) {
-            state.next_tie = cluster;
+    void append_if_active(const StateRecord &record) {
+        if (record_is_active(record)) {
+            records_.push_back(record);
         }
-        return;
     }
 
-    long pid_value = 0;
-    unsigned long long start_time = 0;
-    std::string start_text;
-    std::string cluster_text;
-    Cluster cluster;
-    if (!parse_long(first, pid_value) || pid_value <= 0 || !(fields >> start_text >> cluster_text) ||
-        !parse_unsigned_long_long(start_text, start_time) ||
-        !cluster_from_token(cluster_text, cluster)) {
-        return;
+    void append(pid_t pid, unsigned long long start_time, Cluster cluster) {
+        records_.push_back(StateRecord{pid, start_time, cluster});
     }
 
-    StateRecord record{static_cast<pid_t>(pid_value), start_time, cluster};
-    if (record_is_active(record)) {
-        state.records.push_back(record);
+    void remove(pid_t pid, unsigned long long start_time) {
+        auto kept = std::vector<StateRecord>{};
+        kept.reserve(records_.size());
+
+        for (const StateRecord &record : records_) {
+            if (record.pid != pid || record.start_time != start_time) {
+                kept.push_back(record);
+            }
+        }
+
+        records_ = std::move(kept);
     }
-}
+
+    RouteDecision choose_route() {
+        RouteDecision decision;
+
+        for (const StateRecord &record : records_) {
+            if (record.cluster == Cluster::A100) {
+                ++decision.a100_count;
+            } else {
+                ++decision.x100_count;
+            }
+        }
+
+        if (decision.x100_count < decision.a100_count) {
+            decision.desired = Cluster::X100;
+            return decision;
+        }
+        if (decision.a100_count < decision.x100_count) {
+            decision.desired = Cluster::A100;
+            return decision;
+        }
+
+        decision.tied = true;
+        decision.desired = next_tie_;
+        next_tie_ = decision.desired == Cluster::A100 ? Cluster::X100 : Cluster::A100;
+        return decision;
+    }
+
+    std::string serialize() const {
+        std::string output = "# randcore-compiler state v1\n";
+        output += "next_tie ";
+        output += cluster_token(next_tie_);
+        output += '\n';
+
+        for (const StateRecord &record : records_) {
+            output += std::to_string(static_cast<long>(record.pid));
+            output += ' ';
+            output += std::to_string(record.start_time);
+            output += ' ';
+            output += cluster_token(record.cluster);
+            output += '\n';
+        }
+
+        return output;
+    }
+
+  private:
+    Cluster next_tie_ = Cluster::A100;
+    std::vector<StateRecord> records_;
+};
 
 bool read_state_fd(int fd, RandcoreState &state) {
-    state = RandcoreState{};
+    RandcoreState parsed;
 
     if (lseek(fd, 0, SEEK_SET) < 0) {
         return false;
@@ -354,9 +466,10 @@ bool read_state_fd(int fd, RandcoreState &state) {
     std::istringstream stream(content);
     std::string line;
     while (std::getline(stream, line)) {
-        parse_state_line(state, line);
+        parsed.parse_line(line);
     }
 
+    state = std::move(parsed);
     return true;
 }
 
@@ -365,66 +478,8 @@ bool write_state_fd(int fd, const RandcoreState &state) {
         return false;
     }
 
-    std::string output = "# randcore-compiler state v1\n";
-    output += "next_tie ";
-    output += cluster_token(state.next_tie);
-    output += '\n';
-
-    for (const StateRecord &record : state.records) {
-        output += std::to_string(static_cast<long>(record.pid));
-        output += ' ';
-        output += std::to_string(record.start_time);
-        output += ' ';
-        output += cluster_token(record.cluster);
-        output += '\n';
-    }
-
+    std::string output = state.serialize();
     return write_all(fd, output.data(), output.size()) == 0;
-}
-
-std::string make_state_path(const std::string &state_dir, const char *suffix) {
-    std::string path = state_dir;
-    if (!path.empty() && path.back() != '/') {
-        path += '/';
-    }
-
-    path += kStateBasename;
-    path += '-';
-    path += std::to_string(static_cast<unsigned long>(getuid()));
-    path += '.';
-    path += suffix;
-    return path;
-}
-
-bool lock_state_file(int fd) {
-    flock lock{};
-    lock.l_type = F_WRLCK;
-    lock.l_whence = SEEK_SET;
-
-    while (fcntl(fd, F_SETLKW, &lock) < 0) {
-        if (errno == EINTR) {
-            continue;
-        }
-        return false;
-    }
-
-    return true;
-}
-
-bool open_state_files(const std::string &state_dir, StateFiles &files) {
-    files.lock_path = make_state_path(state_dir, "lock");
-    files.state_path = make_state_path(state_dir, "state");
-
-    files.lock_fd.reset(open(files.lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600));
-    if (!files.lock_fd.valid()) {
-        return false;
-    }
-    if (!lock_state_file(files.lock_fd.get())) {
-        return false;
-    }
-
-    files.state_fd.reset(open(files.state_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600));
-    return files.state_fd.valid();
 }
 
 void warn_errno_path(bool quiet, const char *message, const char *path, int errnum) {
@@ -438,32 +493,6 @@ void warn_errno_path(bool quiet, const char *message, const char *path, int errn
         std::fprintf(stderr, "randcore-compiler: %s %s: %s\n", message, path,
                      std::strerror(errnum));
     }
-}
-
-RouteDecision choose_route(RandcoreState &state) {
-    RouteDecision decision;
-
-    for (const StateRecord &record : state.records) {
-        if (record.cluster == Cluster::A100) {
-            ++decision.a100_count;
-        } else {
-            ++decision.x100_count;
-        }
-    }
-
-    if (decision.x100_count < decision.a100_count) {
-        decision.desired = Cluster::X100;
-        return decision;
-    }
-    if (decision.a100_count < decision.x100_count) {
-        decision.desired = Cluster::A100;
-        return decision;
-    }
-
-    decision.tied = true;
-    decision.desired = state.next_tie;
-    state.next_tie = decision.desired == Cluster::A100 ? Cluster::X100 : Cluster::A100;
-    return decision;
 }
 
 void send_child_report(int fd, int status, int errnum, Cluster cluster) {
@@ -552,35 +581,22 @@ int wait_for_child(pid_t pid, bool quiet) {
     return 1;
 }
 
-void remove_state_record(RandcoreState &state, pid_t pid, unsigned long long start_time) {
-    std::vector<StateRecord> kept;
-    kept.reserve(state.records.size());
-
-    for (const StateRecord &record : state.records) {
-        if (record.pid != pid || record.start_time != start_time) {
-            kept.push_back(record);
-        }
-    }
-
-    state.records = std::move(kept);
-}
-
 void cleanup_child_record(const std::string &state_dir, pid_t pid, unsigned long long start_time,
                           bool quiet) {
     StateFiles files;
-    if (!open_state_files(state_dir, files)) {
+    if (!files.open(state_dir)) {
         warn_errno_path(quiet, "failed to open state for cleanup", state_dir.c_str(), errno);
         return;
     }
 
     RandcoreState state;
-    if (!read_state_fd(files.state_fd.get(), state)) {
+    if (!read_state_fd(files.state_fd(), state)) {
         warn_errno_path(quiet, "failed to read state for cleanup", state_dir.c_str(), errno);
         return;
     }
 
-    remove_state_record(state, pid, start_time);
-    if (!write_state_fd(files.state_fd.get(), state)) {
+    state.remove(pid, start_time);
+    if (!write_state_fd(files.state_fd(), state)) {
         warn_errno_path(quiet, "failed to write state for cleanup", state_dir.c_str(), errno);
     }
 }
@@ -602,28 +618,28 @@ int run_balanced(int argc, char **argv, const std::string &compiler_name,
     std::vector<char *> exec_argv = make_exec_argv(argc, argv, compiler_name);
 
     StateFiles files;
-    if (!open_state_files(state_dir, files)) {
+    if (!files.open(state_dir)) {
         int saved_errno = errno;
         warn_errno_path(quiet, "failed to open state directory", state_dir.c_str(), saved_errno);
         return strict ? 1 : run_untracked_x100(compiler_name, exec_argv, log);
     }
 
     RandcoreState state;
-    if (!read_state_fd(files.state_fd.get(), state)) {
+    if (!read_state_fd(files.state_fd(), state)) {
         int saved_errno = errno;
         files.close();
         warn_errno_path(quiet, "failed to read state", state_dir.c_str(), saved_errno);
         return strict ? 1 : run_untracked_x100(compiler_name, exec_argv, log);
     }
 
-    if (!write_state_fd(files.state_fd.get(), state)) {
+    if (!write_state_fd(files.state_fd(), state)) {
         int saved_errno = errno;
         files.close();
         warn_errno_path(quiet, "failed to write state", state_dir.c_str(), saved_errno);
         return strict ? 1 : run_untracked_x100(compiler_name, exec_argv, log);
     }
 
-    RouteDecision decision = choose_route(state);
+    RouteDecision decision = state.choose_route();
 
     int pipe_fds[2];
     if (pipe2(pipe_fds, O_CLOEXEC) != 0) {
@@ -668,7 +684,7 @@ int run_balanced(int argc, char **argv, const std::string &compiler_name,
                                                                            : Cluster::X100;
 
         if (read_proc_start_time(child, child_start_time)) {
-            state.records.push_back(StateRecord{child, child_start_time, actual});
+            state.append(child, child_start_time, actual);
             recorded_child = true;
         } else if (!quiet) {
             std::fprintf(stderr, "randcore-compiler: failed to record child PID %ld: %s\n",
@@ -690,7 +706,7 @@ int run_balanced(int argc, char **argv, const std::string &compiler_name,
             }
         }
 
-        if (!write_state_fd(files.state_fd.get(), state)) {
+        if (!write_state_fd(files.state_fd(), state)) {
             warn_errno_path(quiet, "failed to write state", state_dir.c_str(), errno);
             recorded_child = false;
         }
