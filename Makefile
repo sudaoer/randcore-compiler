@@ -1,5 +1,5 @@
-CC ?= cc
-CFLAGS ?= -O2 -Wall -Wextra -std=c11
+CXX ?= g++
+CXXFLAGS ?= -O2 -Wall -Wextra -std=c++17
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 PRIMARY := randcore-gcc
@@ -9,8 +9,8 @@ WRAPPERS ?= randcore-gcc randcore-g++ randcore-clang randcore-clang++ randcore-c
 
 all: $(WRAPPERS)
 
-$(PRIMARY): compiler-wrapper.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $<
+$(PRIMARY): compiler-wrapper.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
 
 $(filter-out $(PRIMARY),$(WRAPPERS)): $(PRIMARY)
 	cp -f $(PRIMARY) $@

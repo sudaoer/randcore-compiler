@@ -18,6 +18,8 @@ wrapper 的目标编译器由文件名决定：`randcore-xxx` 会自动执行 `P
 
 ## 构建
 
+源码是 `compiler-wrapper.cpp`，默认使用 `g++` 和 C++17 编译：
+
 ```sh
 make
 ```
