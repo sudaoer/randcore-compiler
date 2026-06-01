@@ -51,6 +51,18 @@ struct Counts {
     std::size_t a100 = 0;
 };
 
+struct MarkAiResult {
+    std::size_t attempted = 0;
+    std::size_t marked = 0;
+    std::size_t skipped_exited = 0;
+    std::size_t failed = 0;
+    pid_t first_failed_pid = 0;
+    int first_errno = 0;
+    bool root_marked = false;
+    bool root_exited = false;
+    bool root_failed = false;
+};
+
 struct Config {
     std::vector<pid_t> parent_pids;
     std::vector<std::string> match_patterns;
@@ -418,6 +430,11 @@ bool mark_ai_thread(pid_t pid, const std::string &proc_ai_thread) {
     return ok;
 }
 
+bool process_still_matches(pid_t pid, unsigned long long start_time) {
+    ProcessInfo current;
+    return read_proc_stat(pid, current) && current.start_time == start_time;
+}
+
 bool parse_cpu_number(const std::string &text, int &value) {
     long parsed = 0;
     if (!parse_long(text, parsed) || parsed < 0 || parsed > 1024) {
@@ -621,7 +638,7 @@ class ChildBalancer {
 
         std::string matched_name = find_matching_name(pid, config_.match_patterns);
         if (!matched_name.empty()) {
-            return manage_process(proc_it->second, matched_name);
+            return manage_process(proc_it->second, matched_name, processes, children);
         }
 
         auto child_it = children.find(pid);
@@ -637,25 +654,125 @@ class ChildBalancer {
         return true;
     }
 
-    bool manage_process(const ProcessInfo &process, const std::string &matched_name) {
+    std::vector<ProcessInfo>
+    collect_subtree(const ProcessInfo &root,
+                    const std::unordered_map<pid_t, ProcessInfo> &processes,
+                    const std::unordered_map<pid_t, std::vector<pid_t>> &children) const {
+        std::vector<ProcessInfo> result;
+        std::vector<pid_t> stack;
+        std::unordered_set<pid_t> seen;
+
+        stack.push_back(root.pid);
+        while (!stack.empty()) {
+            pid_t pid = stack.back();
+            stack.pop_back();
+
+            if (!seen.insert(pid).second) {
+                continue;
+            }
+
+            auto proc_it = processes.find(pid);
+            if (proc_it == processes.end()) {
+                continue;
+            }
+            result.push_back(proc_it->second);
+
+            auto child_it = children.find(pid);
+            if (child_it == children.end()) {
+                continue;
+            }
+            for (auto it = child_it->second.rbegin(); it != child_it->second.rend(); ++it) {
+                stack.push_back(*it);
+            }
+        }
+
+        return result;
+    }
+
+    MarkAiResult
+    mark_ai_subtree(const ProcessInfo &root,
+                    const std::unordered_map<pid_t, ProcessInfo> &processes,
+                    const std::unordered_map<pid_t, std::vector<pid_t>> &children) const {
+        MarkAiResult result;
+        for (const ProcessInfo &process : collect_subtree(root, processes, children)) {
+            ++result.attempted;
+            if (mark_ai_thread(process.pid, config_.proc_ai_thread)) {
+                ++result.marked;
+                if (process.pid == root.pid) {
+                    result.root_marked = true;
+                }
+                continue;
+            }
+
+            int saved_errno = errno;
+            if (!process_still_matches(process.pid, process.start_time)) {
+                ++result.skipped_exited;
+                if (process.pid == root.pid) {
+                    result.root_exited = true;
+                }
+                continue;
+            }
+
+            ++result.failed;
+            if (result.first_failed_pid == 0) {
+                result.first_failed_pid = process.pid;
+                result.first_errno = saved_errno;
+            }
+            if (process.pid == root.pid) {
+                result.root_failed = true;
+            }
+        }
+
+        return result;
+    }
+
+    bool manage_process(
+        const ProcessInfo &process, const std::string &matched_name,
+        const std::unordered_map<pid_t, ProcessInfo> &processes,
+        const std::unordered_map<pid_t, std::vector<pid_t>> &children) {
         Counts before = counts();
         bool tied = false;
         Cluster desired = choose_route(before, tied);
         Cluster actual = desired;
+        MarkAiResult mark_result;
 
         if (desired == Cluster::A100) {
-            if (!config_.dry_run && !mark_ai_thread(process.pid, config_.proc_ai_thread)) {
-                int saved_errno = errno;
+            if (config_.dry_run) {
+                mark_result.attempted = collect_subtree(process, processes, children).size();
+                mark_result.marked = mark_result.attempted;
+                mark_result.root_marked = true;
+            } else {
+                mark_result = mark_ai_subtree(process, processes, children);
+            }
+
+            if (!mark_result.root_marked) {
+                if (mark_result.root_exited) {
+                    return true;
+                }
+
                 if (!config_.quiet) {
                     std::fprintf(stderr,
-                                 "randcore-child-balancer: failed to mark PID %ld (%s) as A100 via %s: %s\n",
+                                 "randcore-child-balancer: failed to mark PID %ld (%s) subtree as A100 via %s: %s\n",
                                  static_cast<long>(process.pid), matched_name.c_str(),
-                                 config_.proc_ai_thread.c_str(), std::strerror(saved_errno));
+                                 config_.proc_ai_thread.c_str(),
+                                 std::strerror(mark_result.first_errno));
                 }
                 if (config_.strict) {
                     return false;
                 }
                 actual = Cluster::X100;
+            } else if (mark_result.failed > 0) {
+                if (!config_.quiet) {
+                    std::fprintf(stderr,
+                                 "randcore-child-balancer: failed to mark %zu PID(s) under PID %ld (%s) as A100 via %s; first failed pid=%ld: %s\n",
+                                 mark_result.failed, static_cast<long>(process.pid),
+                                 matched_name.c_str(), config_.proc_ai_thread.c_str(),
+                                 static_cast<long>(mark_result.first_failed_pid),
+                                 std::strerror(mark_result.first_errno));
+                }
+                if (config_.strict) {
+                    return false;
+                }
             }
         } else {
             Cluster detected = Cluster::X100;
@@ -671,16 +788,17 @@ class ChildBalancer {
             const char *dry_run_text = config_.dry_run ? " dry-run" : "";
             if (desired == actual) {
                 std::fprintf(stderr,
-                             "randcore-child-balancer:%s%s X100 count=%zu A100 count=%zu -> %s pid=%ld name=%s\n",
+                             "randcore-child-balancer:%s%s X100 count=%zu A100 count=%zu -> %s pid=%ld name=%s subtree=%zu\n",
                              tie_text, dry_run_text, before.x100, before.a100,
                              cluster_name(actual), static_cast<long>(process.pid),
-                             matched_name.c_str());
+                             matched_name.c_str(), mark_result.attempted);
             } else {
                 std::fprintf(stderr,
-                             "randcore-child-balancer:%s%s X100 count=%zu A100 count=%zu -> %s, actual %s pid=%ld name=%s\n",
+                             "randcore-child-balancer:%s%s X100 count=%zu A100 count=%zu -> %s, actual %s pid=%ld name=%s subtree=%zu\n",
                              tie_text, dry_run_text, before.x100, before.a100,
                              cluster_name(desired), cluster_name(actual),
-                             static_cast<long>(process.pid), matched_name.c_str());
+                             static_cast<long>(process.pid), matched_name.c_str(),
+                             mark_result.attempted);
             }
         }
 

@@ -72,7 +72,8 @@ wrapper 默认把状态写到 `/tmp/randcore-compiler-$UID.state`，锁文件为
 重要规则：
 
 - `RANDCORE_PARENT_PIDS` 指定的是根 PID，根 PID 自身不会被调度，服务只扫描它的后代。
-- 当某个后代命中 `RANDCORE_MATCH_NAMES` 并纳入管理后，服务会停止继续扫描这个进程的子树。例如 `make -> gcc -> ld` 中只管理 `gcc`，不会再单独管理 `ld`。
+- 当某个后代命中 `RANDCORE_MATCH_NAMES` 并纳入管理后，服务会停止继续把这个进程的子树作为独立任务调度。例如 `make -> gcc -> ld` 中只管理 `gcc`，不会再单独管理 `ld`。
+- 选择 A100 时，服务会把命中的进程和当次扫描快照里已经存在的整个子树一起写入 `/proc/set_ai_thread`，避免 `gcc/c++` 在扫描间隔内已经 fork 出 `cc1/cc1plus` 时漏标。
 - 未命中的中间进程不会阻断扫描。例如 `make -> sh -> gcc` 仍会管理 `gcc`。
 - 选择 A100 时写 `/proc/set_ai_thread`。选择 X100 时保持默认 Regular/X100 行为，因为当前内核只暴露用户态设置 AI 线程的接口。
 
