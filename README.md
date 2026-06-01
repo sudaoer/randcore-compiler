@@ -24,7 +24,7 @@ wrapper 的目标编译器由文件名决定：`randcore-xxx` 会自动执行 `P
 make
 ```
 
-默认会生成：
+默认只会生成 wrapper：
 
 ```text
 randcore-gcc
@@ -40,6 +40,8 @@ randcore-c++
 ```sh
 make randcore-riscv64-linux-gnu-gcc
 ```
+
+默认 `make` 和 `make install` 不会构建或安装 `randcore-child-balancer` 服务。服务需要显式构建和安装，见下文。
 
 ## 使用
 
@@ -69,6 +71,8 @@ wrapper 默认把状态写到 `/tmp/randcore-compiler-$UID.state`，锁文件为
 
 如果无法通过 `CC/CXX` 指定 wrapper，可以使用 `randcore-child-balancer` 监控已有构建进程树。服务从指定父 PID 的后代中查找匹配的编译器进程，并按 X100/A100 当前管理数量做均衡调度。
 
+注意：X100 和 A100 核心的 V 扩展 vlen 不同，不应该对会使用 V 扩展的程序使用这个服务。服务是在进程已经启动后从外部发现并设置 HMP 标志，可能晚于程序或其子进程执行 V 指令。`randcore-*` wrapper 是在真实程序启动前设置亲和性，再 `exec` 到目标程序，因此可以放心用于这类程序。
+
 重要规则：
 
 - `RANDCORE_PARENT_PIDS` 指定的是根 PID，根 PID 自身不会被调度，服务只扫描它的后代。
@@ -83,10 +87,10 @@ wrapper 默认把状态写到 `/tmp/randcore-compiler-$UID.state`，锁文件为
 make randcore-child-balancer
 ```
 
-安装：
+安装服务：
 
 ```sh
-sudo make install
+sudo make install-child-balancer
 sudo cp /etc/randcore-child-balancer.env.example /etc/randcore-child-balancer.env
 ```
 
