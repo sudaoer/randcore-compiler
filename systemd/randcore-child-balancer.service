@@ -1,0 +1,15 @@
+[Unit]
+Description=Randcore child process HMP balancer
+Documentation=file:/usr/local/share/doc/randcore-compiler/README.md
+ConditionPathExists=/proc/set_ai_thread
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/randcore-child-balancer.env
+ExecStart=/usr/local/sbin/randcore-child-balancer
+Restart=on-failure
+RestartSec=1s
+RuntimeDirectory=randcore-child-balancer
+
+[Install]
+WantedBy=multi-user.target

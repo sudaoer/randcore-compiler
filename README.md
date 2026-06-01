@@ -57,13 +57,66 @@ wrapper 默认把状态写到 `/tmp/randcore-compiler-$UID.state`，锁文件为
 
 如果状态文件不可用，默认会打印警告并直接执行真实编译器，此时不记录任务状态。若选择 A100 但写入 `/proc/set_ai_thread` 失败，默认会打印警告并回退到 X100/default 路径继续执行。
 
-## 配置项
+## wrapper 配置项
 
 - `RANDCORE_STATE_DIR`：状态文件和锁文件目录，默认 `/tmp`。
 - `RANDCORE_SET_AI_THREAD`：HMP proc 文件路径，默认 `/proc/set_ai_thread`。
 - `RANDCORE_STRICT=1`：状态文件/锁失败，或选择 A100 但写入 `/proc/set_ai_thread` 失败时直接退出。
 - `RANDCORE_QUIET=1`：隐藏状态文件或 `/proc/set_ai_thread` 失败时的警告。
 - `RANDCORE_LOG=1`：打印每次路由决策和当前计数。
+
+## 子进程均衡服务
+
+如果无法通过 `CC/CXX` 指定 wrapper，可以使用 `randcore-child-balancer` 监控已有构建进程树。服务从指定父 PID 的后代中查找匹配的编译器进程，并按 X100/A100 当前管理数量做均衡调度。
+
+重要规则：
+
+- `RANDCORE_PARENT_PIDS` 指定的是根 PID，根 PID 自身不会被调度，服务只扫描它的后代。
+- 当某个后代命中 `RANDCORE_MATCH_NAMES` 并纳入管理后，服务会停止继续扫描这个进程的子树。例如 `make -> gcc -> ld` 中只管理 `gcc`，不会再单独管理 `ld`。
+- 未命中的中间进程不会阻断扫描。例如 `make -> sh -> gcc` 仍会管理 `gcc`。
+- 选择 A100 时写 `/proc/set_ai_thread`。选择 X100 时保持默认 Regular/X100 行为，因为当前内核只暴露用户态设置 AI 线程的接口。
+
+构建 daemon：
+
+```sh
+make randcore-child-balancer
+```
+
+安装：
+
+```sh
+sudo make install
+sudo cp /etc/randcore-child-balancer.env.example /etc/randcore-child-balancer.env
+```
+
+编辑 `/etc/randcore-child-balancer.env`：
+
+```sh
+RANDCORE_PARENT_PIDS=12345
+RANDCORE_MATCH_NAMES=*gcc,*g++,gcc,g++,cc,c++,clang,clang++
+RANDCORE_SCAN_INTERVAL_MS=100
+RANDCORE_LOG=1
+```
+
+启用服务：
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now randcore-child-balancer.service
+sudo journalctl -u randcore-child-balancer.service -f
+```
+
+服务配置项：
+
+- `RANDCORE_PARENT_PIDS`：逗号、分号或空白分隔的根 PID 列表。
+- `RANDCORE_MATCH_NAMES`：逗号、分号或空白分隔的 `fnmatch` 模式，默认 `*gcc,*g++,gcc,g++,cc,c++,clang,clang++`。
+- `RANDCORE_SCAN_INTERVAL_MS`：扫描间隔，默认 `100`，允许范围 `10` 到 `60000`。
+- `RANDCORE_SET_AI_THREAD`：HMP proc 文件路径，默认 `/proc/set_ai_thread`。
+- `RANDCORE_STRICT=1`：写 `/proc/set_ai_thread` 失败时退出服务。
+- `RANDCORE_QUIET=1`：隐藏警告。
+- `RANDCORE_LOG=1`：打印每次纳入管理的路由决策。
+- `RANDCORE_DRY_RUN=1`：只打印决策，不写 `/proc/set_ai_thread`。
+- `RANDCORE_ONESHOT=1`：扫描一次后退出，主要用于验证。
 
 ## 验证
 
@@ -83,6 +136,28 @@ wait
 - 日志中的 `X100 count=... A100 count=... -> ...` 会优先选择任务数较少的一边。
 - X100 任务的 `Cpus_allowed_list` 通常是 `0-7`。
 - A100 任务的 `Cpus_allowed_list` 通常是 `8-15`。
+
+检查子进程均衡服务的 dry-run 行为：
+
+```sh
+bash -c '
+  exec -a gcc bash -c "exec -a ld sleep 10 & wait" &
+  fake=$!
+  sleep 0.2
+  RANDCORE_PARENT_PIDS=$$ RANDCORE_MATCH_NAMES=gcc,ld RANDCORE_DRY_RUN=1 RANDCORE_LOG=1 \
+    ./randcore-child-balancer --once
+  kill "$fake" 2>/dev/null || true
+  wait "$fake" 2>/dev/null || true
+'
+```
+
+在真实构建中，日志会显示纳入管理的顶层匹配进程：
+
+```text
+randcore-child-balancer: tie dry-run X100 count=0 A100 count=0 -> A100 pid=12346 name=gcc
+```
+
+如果 `gcc` 已被纳入管理，它启动的 `ld` 不应再次出现在服务日志中。
 
 ## 许可证
 
